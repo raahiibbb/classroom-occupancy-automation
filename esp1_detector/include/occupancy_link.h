@@ -51,4 +51,23 @@ typedef struct __attribute__((packed)) {
   uint32_t seq;
 } ctrl_msg_t;
 
+// Detector -> controller, at detector boot: "I have just (re)started".
+//
+// Resetting EITHER board must put the whole system back to a fresh idle state
+// (room assumed empty, detector not sending, appliances and LED off). The
+// controller resets itself simply by booting idle, but when only the detector
+// reboots the controller has no way to know -- so the detector says so. The
+// controller answers by resetting to fresh idle and broadcasting IDLE.
+//
+// Broadcasts are unacknowledged, so the detector repeats HELLO about once a
+// second until it hears an IDLE, and it IGNORES any RUN command until then. A
+// lost HELLO therefore only delays the sync; it can never leave the detector
+// running on a stale RUN from before its reboot.
+static const uint8_t MSG_HELLO = 0xA3;  // detector -> controller, at boot
+
+typedef struct __attribute__((packed)) {
+  uint8_t  tag;         // MSG_HELLO
+  uint32_t seq;         // counts HELLO attempts since this boot
+} hello_msg_t;
+
 #endif // OCCUPANCY_LINK_H

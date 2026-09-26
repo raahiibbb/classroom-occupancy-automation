@@ -6,19 +6,21 @@ actually are, rather than on a single switch for the whole room.
 A ceiling-mounted camera board runs a small neural network that divides the floor
 into a 3×3 grid and decides which zones are occupied. A second board receives
 those readings over a wireless link, smooths them, and drives one relay per zone.
-A PIR motion sensor lets the whole system stand down while the room is empty.
+A PIR motion sensor wakes the camera when someone comes in, and the system goes
+back to sleep once the room has been empty for a while.
 
 ```
         ┌──────────────────────────┐                  ┌───────────────────────────┐
         │  ESP-1  ESP32-S3 + OV3660│   grid, ~1.4 Hz  │  ESP-2  ESP32 NodeMCU     │
         │                          │ ───────────────► │                           │
-        │  capture → warp → CLAHE  │                  │  smoothing + thresholds   │
-        │  → int8 CNN → 3×3 grid   │ ◄─────────────── │  relay control            │
+        │  capture → warp → CLAHE  │   hello at boot  │  smoothing + thresholds   │
+        │  → int8 CNN → 3×3 grid   │ ───────────────► │  relay control            │
+        │                          │ ◄─────────────── │  run / sleep decision     │
         └──────────────────────────┘   run / idle     └───────────┬───────────────┘
                                                                   │
-                                                    ┌─────────────┴─────────────┐
-                                                    │                           │
-                                              HC-SR501 PIR            4 fans + 5 bulbs
+                                        ┌─────────────────────────┼──────────────────┐
+                                        │                         │                  │
+                                  HC-SR501 PIR            4 fans + 5 bulbs      status LED
 ```
 
 ## Repository layout
@@ -70,16 +72,20 @@ Two thresholds rather than one is the important part. With a single cut-off, a
 zone sitting near the boundary would switch on and off repeatedly; the gap
 between the thresholds removes that entirely.
 
-### Standing down when the room is empty
+### When the detector runs
 
-The detector does not run continuously. ESP-2 decides when ESP-1 should work:
+The camera does not run all the time. ESP-2 decides when ESP-1 should work:
 
 | Rule | Value | Meaning |
 |------|-------|---------|
-| Idle after | 150 consecutive empty frames | roughly 1.8 minutes of an empty room |
-| Wake on | any PIR motion | after the sensor's warm-up period |
-| Motion keeps it awake for | 60 s after any motion | see below |
-| PIR warm-up | 60 s from power-up | the HC-SR501 reports spurious motion until it settles |
+| At power-up or reset | asleep | the room is assumed empty until the PIR says otherwise |
+| Wakes on | any PIR motion | once the sensor has warmed up |
+| PIR warm-up | 10 s after ESP-2 powers up | motion is ignored while the HC-SR501 settles |
+| Goes back to sleep after | 150 consecutive empty frames | roughly 1.8 minutes of an empty room |
+| Motion blocks sleep for | 60 s after the last motion | see below |
+
+While asleep, ESP-1 keeps its camera and radio initialised, so waking up is
+immediate, but it captures no frames, runs no inference and sends nothing.
 
 The empty-room count uses the **smoothed** verdict, not the raw frames, so a
 single false positive cannot reset it. This is also why the decision lives on
@@ -87,19 +93,65 @@ ESP-2: that flicker-free view of the room already exists there, and the PIR is
 wired to the same board, so all of the policy sits in one place while ESP-1
 stays a straightforward sensor.
 
-Recent motion also blocks the detector from standing down, independently of what
-the camera reports. This covers the case where somebody is in the room but is not
-inside any of the nine mapped zones — standing at the edge, or in a corner the
-grid does not cover. The camera sees an empty floor and the empty-frame count
-climbs, but every movement the PIR picks up pushes the block forward, so the
-detector keeps running. In effect the sensor gets to overrule the camera.
+Recent motion also blocks the detector from going to sleep, independently of
+what the camera reports. This covers the case where somebody is in the room but
+is not inside any of the nine mapped zones — standing at the edge, or in a corner
+the grid does not cover. The camera sees an empty floor and the empty-frame count
+climbs, but the block lasts for as long as the PIR keeps reporting motion plus
+60 s afterwards, so the detector keeps running. In effect the sensor gets to
+overrule the camera. (The HC-SR501 holds its output high for as long as motion
+continues, so the block is refreshed for that whole time, not just when motion
+first starts.)
+
+The 10 s warm-up is deliberately short. The PIR only **wakes the camera** — it
+never switches an appliance itself, because the relays always follow the
+camera's 12-of-20 vote. So the worst a false trigger can do while the sensor is
+still settling is run the camera for a couple of minutes in an empty room. If
+you see motion reported straight after power-up with nobody around, raise
+`PIR_WARMUP_MS` in the sketch to 20–30 s.
+
+### Starting fresh after a power-up or reset
+
+Powering up or resetting **either** board puts the whole system back to the same
+clean state: room assumed empty, camera asleep, every appliance off, status LED
+off. Only PIR motion starts it again.
+
+ESP-2 does this simply by booting asleep and telling ESP-1 so straight away. The
+other direction needs a message, because when only ESP-1 restarts, ESP-2 has no
+way to know. So ESP-1 announces itself: on boot it sends a **hello** once a
+second until ESP-2 replies with "idle", and ESP-2 treats a hello as "the camera
+just restarted" and resets itself to the clean state.
+
+Until that reply arrives, ESP-1 **ignores any "run" command**. Without that, a
+restarted ESP-1 could pick up a "run" that ESP-2 was still repeating from before
+the restart and wake straight back up, skipping the fresh start.
+
+### Keeping the two boards in step
 
 Run/idle state is **re-broadcast every two seconds** rather than sent once.
-Wireless broadcasts are unacknowledged, so a single lost "stand down" message
-would leave the detector running indefinitely; repeating the current state means
-any lost message is corrected by the next one. As a further safeguard, ESP-1
-resumes detecting on its own if it hears nothing from ESP-2 for 30 seconds, so a
-failed controller cannot leave the room unmonitored.
+Wireless broadcasts are unacknowledged, so a single lost "sleep" message would
+leave the detector running indefinitely; repeating the current state means any
+lost message is corrected by the next one.
+
+If ESP-2 goes quiet for 10 seconds while ESP-1 is running, ESP-1 goes to sleep on
+its own. The relays are on ESP-2, so running the camera without it achieves
+nothing — and a silent ESP-2 has most likely been switched off, which should
+leave the system asleep rather than busy. In the other direction, if ESP-1 stops
+sending frames for 15 seconds while it is supposed to be running, ESP-2 switches
+every appliance off.
+
+### Status LED
+
+The LED on ESP-2 shows whether the camera is **actually awake**, as reported by
+the camera itself. Each frame ESP-1 sends is proof that it has just captured an
+image and run the model, so the LED is driven by those frames arriving rather
+than by what ESP-2 has asked for.
+
+| LED | When |
+|-----|------|
+| Off | at power-up or reset, and whenever the camera is asleep |
+| On | as soon as the first frame arrives after a wake-up |
+| Off again | immediately when the system goes to sleep, or 3 s after frames stop if ESP-1 fails while it should be running |
 
 ## Wiring
 
@@ -115,7 +167,7 @@ failed controller cannot leave the room unmonitored.
 | PCLK | 13 | Y7 | 18 |
 | Y8 | 17 | Y9 | 16 |
 
-### ESP-2 — relays and sensor
+### ESP-2 — relays, sensor and LED
 
 | Zone | Appliance | GPIO | Relay type |
 |------|-----------|------|------------|
@@ -129,6 +181,7 @@ failed controller cannot leave the room unmonitored.
 | 7 | Fan 4 | 27 | active-LOW |
 | 8 | Bulb 5 | 4 | active-HIGH |
 | — | PIR output | 35 | input only |
+| — | Status LED | 19 | active-HIGH, through a 220–330 Ω resistor to GND |
 
 Zones are numbered row-major, so zone 0 is the top-left of the camera's view:
 
@@ -159,6 +212,20 @@ The relay board should have its own 5 V supply rather than drawing from the
 ESP32's regulator — nine coils together draw close to an amp. Grounds must be
 common between the two supplies and the board.
 
+### The PIR sensor
+
+- **VCC goes to 5 V (the `VIN` pin), not 3V3.** The HC-SR501 needs at least
+  4.5 V; on 3.3 V it typically never triggers. Its output only swings to 3.3 V,
+  so it connects straight to GPIO 35 without a level shifter.
+- **Wire it by the printed labels, not by position.** The pin order differs
+  between batches; the labels are under the white dome.
+- **Fit the trigger jumper on H** (repeat trigger). With no jumper cap the
+  trigger mode is undefined and the output may never switch.
+- Set the time-delay knob (Tx) fully anticlockwise — ESP-2 already holds for
+  60 s after motion — and start with the sensitivity knob (Sx) in the middle.
+- Keep it connected whenever ESP-2 is running. GPIO 35 has no internal pull
+  resistor, so an unconnected pin floats and can report phantom motion.
+
 ## Message format
 
 Both boards broadcast on a fixed channel, so neither needs the other's MAC
@@ -166,12 +233,17 @@ address and no router is involved. Messages are distinguished by a leading tag
 byte, defined in `occupancy_link.h`:
 
 ```c
-grid_msg_t   // ESP-1 → ESP-2: the nine zone results, plus sequence number
-ctrl_msg_t   // ESP-2 → ESP-1: whether the detector should be running
+grid_msg_t    // ESP-1 → ESP-2: the nine zone results, plus sequence number
+ctrl_msg_t    // ESP-2 → ESP-1: whether the detector should be running
+hello_msg_t   // ESP-1 → ESP-2: "I have just restarted" (sent at boot)
 ```
 
+Every receiver checks both the tag and the length, so a stray packet from some
+other ESP-NOW device on the same channel cannot be mistaken for one of these.
+
 The header is duplicated in both project folders because the boards are built
-with different toolchains. The two copies must stay identical.
+with different toolchains. The two copies must stay identical, and both boards
+must be flashed from the same version.
 
 ## Running the project
 
@@ -183,6 +255,7 @@ Hardware:
 - ESP32 NodeMCU, 30-pin
 - 9-channel relay board
 - HC-SR501 PIR motion sensor
+- An LED and a 220–330 Ω resistor
 - 4 fans and 5 bulbs
 - Two 5 V supplies rated at 1 A or more, one for the boards and one for the relays
 
@@ -250,33 +323,68 @@ recalibration note below.
 
 ### 4. Power up and check
 
-Open a serial monitor on each board at 115200 baud. The camera board should
-report:
+Open a serial monitor on each board at 115200 baud. After some memory and model
+details, the camera board should report that its radio is up and that it is
+waiting, asleep:
 
 ```
-=== Classroom occupancy detector (ESP-1) ===
-Camera ready: OV3660, 800x600 RGB565
-Model ready, arena in use: 325324 bytes
+model_tflite @ 0x3c0a1ae0  (16-byte aligned: yes)
+Model ready (input int8). arena_used=325324 bytes.
+set_channel(1) -> ESP_OK | radio is ACTUALLY on channel 1
+sizeof(grid_msg_t) = 17, ctrl_msg_t = 6, hello_msg_t = 5 bytes (expect 17/6/5)
+esp_now_init() -> ESP_OK
+esp_now_add_peer(broadcast) -> ESP_OK
+esp_now_register_recv_cb() -> ESP_OK
+Sender MAC: XX:XX:XX:XX:XX:XX
 ESP-NOW ready on channel 1
-grid 000 010 000  occupied 1/9  infer 201 ms  seq 1
+FRESH START: idle -- no capture, no grids -- until ESP-2 sends RUN (PIR motion).
+Sending HELLO to ESP-2 every 1 s until it acknowledges with IDLE ...
+>>> SYNCED with ESP-2 after 1 HELLO(s) -- system reset to fresh idle
 ```
 
-and the controller should pick those up within a second or two:
+The address on the first line varies between builds; what matters is
+`aligned: yes`. The controller should report the same channel and the same three
+message sizes, then:
 
 ```
-=== Classroom occupancy controller (ESP-2) ===
-MAC 68:09:47:52:38:AC, listening on channel 1
-Link up: receiving from ESP-1
-seq 12    raw 000 010 000 (1/9)   verdict 000 000 000 (0/9)
+FRESH START: room assumed EMPTY, ESP-1 told to SLEEP, all appliances OFF, LED OFF.
+Only PIR motion wakes ESP-1.
+PIR warming up: motion is ignored for the first 10 s.
 ```
+
+Ten seconds later it prints `PIR ARMED`. Walk across the PIR's field of view and
+you should see, in order:
+
+- on the controller, a `PIR: MOTION DETECTED` banner and `DETECTOR ON`
+- on the camera board, `>>> RUNNING: ESP-2 woke the detector`, followed by a
+  timing line and a 3×3 grid for every frame
+- on the controller, `>>> ESP-1 AWAKE: its frames are arriving -- status LED ON`,
+  with the LED lighting up
 
 Nothing switches immediately, and that is expected: a zone has to be occupied in
 12 of the last 20 frames before its appliance turns on, which takes roughly nine
-seconds of someone actually standing there. Sending `s` to the controller prints
-a full table of votes, verdicts and appliance states.
+seconds of someone actually standing there. Leave the room and, about two minutes
+later, the controller prints `DETECTOR OFF`, the LED goes out, and the camera
+board prints `>>> IDLE`.
 
 Once both boards are behaving, they can run from their own supplies with no
 computer attached.
+
+### Serial commands
+
+On the controller (ESP-2), with the line ending set to *Newline*:
+
+| Command | Effect |
+|---------|--------|
+| `s` | Print the PIR state, run/sleep state, empty-frame count, and a table of votes, verdicts and appliance states |
+| `v` | Switch between the full per-frame printout and one compact line per frame (easier to follow; still shows the PIR and LED state) |
+
+On the camera board (ESP-1), for debugging the image pipeline while it is awake:
+
+| Command | Effect |
+|---------|--------|
+| `B` | Dump the exact 96×96 image the model sees, as hex |
+| `D` | Dump the same image as raw bytes |
 
 ### Recalibrating after moving the camera
 
@@ -294,10 +402,16 @@ the inverse homography from those four point pairs.
 
 | Symptom | Likely cause |
 |---------|--------------|
-| Controller never prints `Link up` | The boards are on different channels, or the camera board is not powered |
-| Appliances never switch on | Often correct — an empty room keeps everything off by design. Check the `verdict` line rather than the relays |
+| Nothing happens when you walk in | The system starts asleep and only the PIR wakes it. Wait for `PIR ARMED`, then move *across* the sensor's view — see [The PIR sensor](#the-pir-sensor) |
+| PIR never reports motion | VCC on 3V3 instead of 5 V, the trigger jumper missing, or wires on the wrong pins. Test it alone: OUT → 330 Ω → LED → GND should light when you move |
+| Motion reported straight after power-up with nobody around | The PIR is still settling — raise `PIR_WARMUP_MS` in the sketch |
+| Controller never prints `LINK UP` after a wake-up | The boards are on different channels, or the camera board is not powered |
+| Status LED never lights | It only lights while the camera is awake *and* sending frames; check the camera board woke up and is powered |
+| Appliances never switch on | Often correct — an empty room keeps everything off by design. Check the verdict in the printout rather than the relays |
 | Controller will not flash, `Failed to communicate with the flash chip` | Something is connected to GPIO 12, which must stay free |
 | Camera board works on USB but not on a power adapter | The supply cannot deliver enough current; peaks go well past 500 mA |
+| Controller prints `Receiver MAC: 00:00:00:00:00:00` | The radio did not start; reset the board |
+| Every zone reads occupied, all the time | The model buffer has lost its alignment — see the note below |
 | Zones respond, but the wrong ones | The camera has moved relative to the calibration — see above |
 
 ## Notes
@@ -305,4 +419,22 @@ the inverse homography from those four point pairs.
 The model buffer in `model.cc` is declared `alignas(16)`. This is required, not
 cosmetic — the optimised SIMD kernels read weights directly from that buffer and
 assume 16-byte alignment. Without it the convolutions return saturated nonsense
-at normal speed, with no crash and no error message.
+at normal speed, with no crash and no error message: every zone reads about
+0.996 and the whole grid shows occupied. Where the buffer lands depends on
+everything else linked into the program, so an unaligned buffer can work by luck
+and then break when unrelated code is added. The camera board prints the
+buffer's address and alignment at boot for this reason.
+
+A few other details were needed to make the boards reliable on their own
+supplies, and are easy to undo by accident:
+
+- **The camera board never waits for a serial connection.** Its USB serial port
+  only reports "connected" when a computer opens it, so waiting for that would
+  hang the board forever on a plain power adapter. It waits at most 1.5 s.
+- **The controller turns WiFi power saving off.** In its default mode the radio
+  sleeps between beacons, and an ESP-NOW receiver that is asleep simply misses
+  most incoming frames.
+- **Both boards wait for the radio to be ready before configuring it.** The
+  Arduino core starts WiFi in the background; setting the channel too early fails
+  without an error, and the board then listens on the wrong channel. Each board
+  reads the channel back and prints it at boot.
